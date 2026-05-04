@@ -1,0 +1,11 @@
+2026-04-25T11:45:17.4789374-04:00 starting backend script
+2026-04-25T11:45:17.5846600-04:00 running uvicorn
+2026-04-25T12:35:21.2897327-04:00 starting backend script
+2026-04-25T12:35:21.3852176-04:00 running uvicorn
+2026-04-25T12:35:24.4095526-04:00 uvicorn exited with code 1
+2026-05-01T20:09:41.0118722-04:00 starting backend script
+2026-05-01T20:09:41.0613564-04:00 running uvicorn
+2026-05-01T20:50:19.1478546-04:00 starting backend script
+2026-05-01T20:50:19.1851355-04:00 running uvicorn
+2026-05-01T20:53:03.3029994-04:00 starting backend script
+2026-05-01T20:53:03.3193884-04:00 running uvicorn
