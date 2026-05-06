@@ -493,25 +493,64 @@ def _first_match(patterns: list[str], text: str, default: str) -> str:
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
-            return match.group(1).strip()
+            value = _plain_text_from_html(match.group(1)).strip(" -|")
+            if value:
+                return value
     return default
+
+
+def _clean_fallback_title(title: str, company: str) -> str:
+    title = unescape(title or "").strip()
+    title = re.sub(r"\s+", " ", title)
+    title = re.sub(r"\s*\|\s*LinkedIn\s*$", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s*-\s*LinkedIn\s*$", "", title, flags=re.IGNORECASE)
+    if " hiring " in title.lower():
+        title = re.split(r"\s+hiring\s+", title, flags=re.IGNORECASE, maxsplit=1)[-1]
+    if company and title.lower().endswith(f" at {company}".lower()):
+        title = title[: -len(f" at {company}")].strip()
+    title = re.split(r"\s+in\s+[A-Z][A-Za-z .'-]+,\s*[A-Z]{2}\b", title, flags=re.IGNORECASE, maxsplit=1)[0]
+    return title or "Unknown role"
+
+
+def _fallback_summary(
+    role: str,
+    company: str,
+    location: str,
+    overall_score: int,
+    analyst_match: bool,
+    internship: bool,
+    visa_positive: bool,
+    visa_negative: bool,
+) -> str:
+    fit_bits = []
+    if analyst_match:
+        fit_bits.append("the posting shows useful data/technical keywords")
+    if internship:
+        fit_bits.append("the seniority looks internship-friendly")
+    if not fit_bits:
+        fit_bits.append("the role details are limited, so this is a cautious match")
+
+    if visa_positive:
+        visa_note = "Visa signals look positive from the posting."
+    elif visa_negative:
+        visa_note = "Visa sponsorship looks risky based on the authorization language."
+    else:
+        visa_note = "Visa sponsorship is unclear, so verify before investing too much time."
+
+    company_text = company if company != "Unknown company" else "the company"
+    location_text = f" in {location}" if location != "Unknown location" else ""
+    return (
+        f"{role} at {company_text}{location_text} looks like a {overall_score}/100 fit because "
+        f"{', and '.join(fit_bits)}. {visa_note}"
+    )
 
 
 def fallback_score_job(job_text: str, url: str, reason: str) -> dict:
     plain_text = _plain_text_from_html(job_text) if job_text else ""
-    title = _first_match(
-        [
-            r"<title[^>]*>(.*?)</title>",
-            r'"title"\s*:\s*"([^"]+)"',
-            r"jobTitle[^>]*>\s*([^<]+)",
-            r"show\-more\-less\-html__markup[^>]*>\s*([^<]{6,80})",
-        ],
-        job_text,
-        "Unknown role",
-    )
     company = _first_match(
         [
             r'"companyName"\s*:\s*"([^"]+)"',
+            r'"name"\s*:\s*"([^"]+)"\s*,\s*"sameAs"',
             r"companyName[^>]*>\s*([^<]+)",
             r"topcard__org-name-link[^>]*>\s*([^<]+)",
             r"topcard__flavor[^>]*>\s*([^<]+)",
@@ -527,6 +566,20 @@ def fallback_score_job(job_text: str, url: str, reason: str) -> dict:
         ],
         job_text,
         "Unknown location",
+    )
+    title = _clean_fallback_title(
+        _first_match(
+            [
+                r"<title[^>]*>(.*?)</title>",
+                r'"title"\s*:\s*"([^"]+)"',
+                r"jobTitle[^>]*>\s*([^<]+)",
+                r"topcard__title[^>]*>\s*([^<]+)",
+                r"show\-more\-less\-html__markup[^>]*>\s*([^<]{6,80})",
+            ],
+            job_text,
+            "Unknown role",
+        ),
+        company,
     )
 
     lower = plain_text.lower()
@@ -544,6 +597,16 @@ def fallback_score_job(job_text: str, url: str, reason: str) -> dict:
     company_quality = 55
     overall_score = round((skill_match + visa_friendliness + seniority_fit + company_quality) / 4)
     verdict = "Apply This Weekend" if overall_score >= 70 else "Low Priority" if overall_score >= 45 else "Skip"
+    summary = _fallback_summary(
+        title,
+        company,
+        location,
+        overall_score,
+        analyst_match,
+        internship,
+        visa_positive,
+        visa_negative,
+    )
 
     return {
         "company": company,
@@ -555,8 +618,11 @@ def fallback_score_job(job_text: str, url: str, reason: str) -> dict:
         "seniority_fit": seniority_fit,
         "company_quality": company_quality,
         "verdict": verdict,
-        "summary": f"Fallback score used because AI scoring was unavailable. Reason: {reason[:220]}",
-        "red_flags": [f"Fallback score: {reason[:180]}"],
+        "summary": summary,
+        "red_flags": [
+            "AI scoring was unavailable, so this was scored with the local fallback rules.",
+            "Visa sponsorship should be verified manually." if not visa_positive else "Confirm visa sponsorship details.",
+        ],
         "green_flags": ["Job was captured and queued despite the scoring service issue."],
         "salary_range": "Unknown",
         "sponsors_visa": "Yes" if visa_positive else "No" if visa_negative else "Unknown",
@@ -564,6 +630,7 @@ def fallback_score_job(job_text: str, url: str, reason: str) -> dict:
         "url": url,
         "scored_at": datetime.utcnow().isoformat(),
         "scoring_source": "fallback",
+        "scoring_note": reason[:300],
     }
 
 
@@ -714,9 +781,10 @@ def send_notification(score: dict):
     overall_score = score.get("overall_score", 0)
     sponsors_visa = score.get("sponsors_visa") or "Unknown"
     summary = score.get("summary") or ""
+    score_label = "Estimated score" if score.get("scoring_source") == "fallback" else "Score"
 
     body = (
-        f"{role} | Score: {overall_score}/100 | Visa: {sponsors_visa}\n"
+        f"{role} | {score_label}: {overall_score}/100 | Visa: {sponsors_visa}\n"
         f"{summary[:350]}"
     )
 
