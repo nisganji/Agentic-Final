@@ -1,7 +1,10 @@
 $logPath = "$PSScriptRoot\backend.start.log"
 Add-Content -Path $logPath -Value "$(Get-Date -Format o) starting backend script"
 
-$envLines = Get-Content -Path .env
+Set-Location -Path $PSScriptRoot
+
+$envPath = Join-Path $PSScriptRoot ".env"
+$envLines = Get-Content -Path $envPath
 foreach ($line in $envLines) {
     if ($line -match '^\s*#' -or $line -notmatch '=') { continue }
     $name, $value = $line -split '=', 2

@@ -11,6 +11,7 @@ import re
 import tempfile
 import time
 from datetime import datetime, timedelta
+from html import unescape
 from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
 import google.generativeai as genai
@@ -21,6 +22,38 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC") or "team7-jobagent-2026"
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _nonnegative_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+MAX_BATCH_JOBS = _positive_int_env("MAX_BATCH_JOBS", 3)
+HTTP_TIMEOUT_SECONDS = _positive_int_env("HTTP_TIMEOUT_SECONDS", 10)
+LINKEDIN_TIMEOUT_SECONDS = _positive_int_env("LINKEDIN_TIMEOUT_SECONDS", 8)
+BATCH_JOB_DELAY_SECONDS = _nonnegative_float_env("BATCH_JOB_DELAY_SECONDS", 0)
+GEMINI_RETRY_ATTEMPTS = _positive_int_env("GEMINI_RETRY_ATTEMPTS", 1)
+GEMINI_RATE_LIMIT_WAIT_SECONDS = _positive_int_env("GEMINI_RATE_LIMIT_WAIT_SECONDS", 2)
+ALLOW_FALLBACK_SCORING = os.environ.get("ALLOW_FALLBACK_SCORING", "true").lower() != "false"
+
 
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY not set. Load your .env or set it in PowerShell first.")
@@ -40,6 +73,7 @@ MODEL_FALLBACKS = [
     if name
 ]
 _active_model_name = None
+_gemini_unavailable_error = None
 
 
 def _is_model_availability_error(exc: Exception) -> bool:
@@ -51,6 +85,18 @@ def _is_model_availability_error(exc: Exception) -> bool:
     )
 
 
+def _is_gemini_configuration_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "api key not found" in message
+        or "api_key_invalid" in message
+        or "api key invalid" in message
+        or "api has not been used" in message
+        or "service_disabled" in message
+        or "permission_denied" in message
+    )
+
+
 def _is_rate_limit_error(exc: Exception) -> bool:
     """Return True if this is a 429 quota/rate-limit error."""
     msg = str(exc).lower()
@@ -59,24 +105,35 @@ def _is_rate_limit_error(exc: Exception) -> bool:
 
 def generate_with_gemini(contents):
     """Generate content using the first available Flash model, with rate-limit retry."""
-    global _active_model_name
+    global _active_model_name, _gemini_unavailable_error
+
+    if _gemini_unavailable_error:
+        raise RuntimeError(_gemini_unavailable_error)
 
     candidates = [_active_model_name] if _active_model_name else []
     candidates.extend(name for name in MODEL_FALLBACKS if name not in candidates)
 
     last_error = None
     for model_name in candidates:
-        # Retry up to 3 times on rate-limit errors with exponential backoff
-        for attempt in range(3):
+        for attempt in range(GEMINI_RETRY_ATTEMPTS):
             try:
                 response = genai.GenerativeModel(model_name).generate_content(contents)
                 _active_model_name = model_name
                 return response
             except Exception as exc:
                 last_error = exc
+                if _is_gemini_configuration_error(exc):
+                    _gemini_unavailable_error = (
+                        "Gemini is not available for the configured API key. "
+                        "Check GEMINI_API_KEY, enable the Gemini API, or create a new key."
+                    )
+                    raise RuntimeError(_gemini_unavailable_error) from exc
                 if _is_rate_limit_error(exc):
-                    wait = 20 * (attempt + 1)  # 20s, 40s, 60s
-                    print(f"[rate limit] 429 hit on {model_name}, waiting {wait}s before retry {attempt + 1}/3...")
+                    wait = GEMINI_RATE_LIMIT_WAIT_SECONDS * (attempt + 1)
+                    print(
+                        f"[rate limit] 429 hit on {model_name}, waiting {wait}s before retry "
+                        f"{attempt + 1}/{GEMINI_RETRY_ATTEMPTS}..."
+                    )
                     time.sleep(wait)
                     continue
                 elif _is_model_availability_error(exc):
@@ -86,10 +143,11 @@ def generate_with_gemini(contents):
         else:
             continue  # all retries exhausted for this model, try next
 
-    raise RuntimeError(
+    _gemini_unavailable_error = (
         "No configured Gemini Flash model is available for generateContent. "
         "Set GEMINI_MODEL in .env to a model listed for your API key."
-    ) from last_error
+    )
+    raise RuntimeError(_gemini_unavailable_error) from last_error
 
 
 CANDIDATE_PROFILE = """
@@ -114,6 +172,16 @@ HEADERS = {
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
     "Prefer": "return=representation",
+}
+
+
+LINKEDIN_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
 }
 
 
@@ -246,18 +314,51 @@ def scrape_url(url: str, max_chars: int = 6000) -> str:
     r = requests.get(
         f"https://r.jina.ai/{url}",
         headers={"Accept": "text/plain", "X-No-Cache": "true"},
-        timeout=45,
+        timeout=HTTP_TIMEOUT_SECONDS,
+    )
+    r.raise_for_status()
+    return r.text[:max_chars]
+
+
+def linkedin_job_id(url: str) -> str | None:
+    parsed = urlparse(url)
+    match = re.search(r"(\d{6,})", parsed.path)
+    return match.group(1) if match else None
+
+
+def scrape_linkedin_guest_job(url: str, max_chars: int = 6000) -> str:
+    job_id = linkedin_job_id(url)
+    if not job_id:
+        raise ValueError("LinkedIn job URL does not contain a job id.")
+
+    r = requests.get(
+        f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}",
+        headers=LINKEDIN_HEADERS,
+        timeout=LINKEDIN_TIMEOUT_SECONDS,
     )
     r.raise_for_status()
     return r.text[:max_chars]
 
 
 def scrape_job(url: str) -> str:
+    if "linkedin.com/jobs/view/" in url.lower():
+        try:
+            return scrape_linkedin_guest_job(url, max_chars=6000)
+        except Exception as exc:
+            status = _http_status(exc)
+            reason = f"HTTP {status}" if status else str(exc)
+            print(f"[warning] LinkedIn guest job scrape failed ({reason}); trying Jina Reader fallback.")
     return scrape_url(url, max_chars=6000)
 
 
+def _http_status(exc: Exception) -> int | None:
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        return exc.response.status_code
+    return None
+
+
 def scrape_linkedin_search(search_url: str) -> str:
-    text_parts = [scrape_url(search_url, max_chars=80000)]
+    text_parts = []
 
     parsed = urlparse(search_url)
     query = parse_qs(parsed.query)
@@ -269,20 +370,21 @@ def scrape_linkedin_search(search_url: str) -> str:
             try:
                 r = requests.get(
                     guest_url,
-                    headers={
-                        "Accept": "text/html,application/xhtml+xml",
-                        "User-Agent": (
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/124.0.0.0 Safari/537.36"
-                        ),
-                    },
-                    timeout=45,
+                    headers=LINKEDIN_HEADERS,
+                    timeout=LINKEDIN_TIMEOUT_SECONDS,
                 )
                 r.raise_for_status()
                 text_parts.append(r.text[:80000])
             except Exception:
                 continue
+
+    if not text_parts:
+        try:
+            text_parts.append(scrape_url(search_url, max_chars=80000))
+        except Exception as exc:
+            status = _http_status(exc)
+            reason = f"HTTP {status}" if status else str(exc)
+            print(f"[warning] Jina Reader failed for LinkedIn search ({reason}).")
 
     return "\n".join(text_parts)
 
@@ -329,7 +431,14 @@ def _clean_linkedin_job_url(url: str) -> str | None:
 
 def extract_linkedin_job_urls(text: str) -> list[str]:
     """Extract individual LinkedIn job URLs or job IDs from Jina search text."""
-    urls: set[str] = set()
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def add_url(url: str | None):
+        if not url or not re.search(r"\d{8,}", url) or url in seen:
+            return
+        seen.add(url)
+        urls.append(url)
 
     url_pattern = re.compile(
         r"https?://(?:www\.)?linkedin\.com/jobs/view/[^\s\]\)\"'<>]+",
@@ -337,8 +446,7 @@ def extract_linkedin_job_urls(text: str) -> list[str]:
     )
     for match in url_pattern.findall(text):
         cleaned = _clean_linkedin_job_url(match)
-        if cleaned:
-            urls.add(cleaned)
+        add_url(cleaned)
 
     id_patterns = [
         r"data-entity-urn=[\"']urn:li:jobPosting:(\d+)",
@@ -352,10 +460,9 @@ def extract_linkedin_job_urls(text: str) -> list[str]:
     ]
     for pattern in id_patterns:
         for job_id in re.findall(pattern, text, flags=re.IGNORECASE):
-            urls.add(f"https://www.linkedin.com/jobs/view/{job_id}")
+            add_url(f"https://www.linkedin.com/jobs/view/{job_id}")
 
-    urls = {u for u in urls if re.search(r'\d{8,}', u)}
-    return sorted(urls)
+    return urls
 
 
 def _parse_gemini_json(raw: str) -> dict:
@@ -372,6 +479,92 @@ def _parse_gemini_json(raw: str) -> dict:
         raw = raw[start : end + 1]
 
     return json.loads(raw.strip())
+
+
+def _plain_text_from_html(text: str) -> str:
+    text = re.sub(r"<script\b[^>]*>.*?</script>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _first_match(patterns: list[str], text: str, default: str) -> str:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return default
+
+
+def fallback_score_job(job_text: str, url: str, reason: str) -> dict:
+    plain_text = _plain_text_from_html(job_text) if job_text else ""
+    title = _first_match(
+        [
+            r"<title[^>]*>(.*?)</title>",
+            r'"title"\s*:\s*"([^"]+)"',
+            r"jobTitle[^>]*>\s*([^<]+)",
+            r"show\-more\-less\-html__markup[^>]*>\s*([^<]{6,80})",
+        ],
+        job_text,
+        "Unknown role",
+    )
+    company = _first_match(
+        [
+            r'"companyName"\s*:\s*"([^"]+)"',
+            r"companyName[^>]*>\s*([^<]+)",
+            r"topcard__org-name-link[^>]*>\s*([^<]+)",
+            r"topcard__flavor[^>]*>\s*([^<]+)",
+        ],
+        job_text,
+        "Unknown company",
+    )
+    location = _first_match(
+        [
+            r'"jobLocation"\s*:\s*"([^"]+)"',
+            r"topcard__flavor--bullet[^>]*>\s*([^<]+)",
+            r"formattedLocation[^>]*>\s*([^<]+)",
+        ],
+        job_text,
+        "Unknown location",
+    )
+
+    lower = plain_text.lower()
+    visa_positive = any(term in lower for term in ["h-1b", "h1b", "visa sponsorship", "will sponsor", "opt"])
+    visa_negative = any(
+        term in lower
+        for term in ["no visa sponsorship", "without sponsorship", "must be authorized", "u.s. citizen", "us citizen"]
+    )
+    analyst_match = any(term in lower for term in ["sql", "python", "tableau", "analytics", "data", "machine learning"])
+    internship = "intern" in lower or "internship" in lower
+
+    skill_match = 65 if analyst_match else 45
+    visa_friendliness = 75 if visa_positive else 20 if visa_negative else 45
+    seniority_fit = 70 if internship else 55
+    company_quality = 55
+    overall_score = round((skill_match + visa_friendliness + seniority_fit + company_quality) / 4)
+    verdict = "Apply This Weekend" if overall_score >= 70 else "Low Priority" if overall_score >= 45 else "Skip"
+
+    return {
+        "company": company,
+        "role": title,
+        "location": location,
+        "overall_score": overall_score,
+        "skill_match": skill_match,
+        "visa_friendliness": visa_friendliness,
+        "seniority_fit": seniority_fit,
+        "company_quality": company_quality,
+        "verdict": verdict,
+        "summary": f"Fallback score used because AI scoring was unavailable. Reason: {reason[:220]}",
+        "red_flags": [f"Fallback score: {reason[:180]}"],
+        "green_flags": ["Job was captured and queued despite the scoring service issue."],
+        "salary_range": "Unknown",
+        "sponsors_visa": "Yes" if visa_positive else "No" if visa_negative else "Unknown",
+        "follow_up_days": 14,
+        "url": url,
+        "scored_at": datetime.utcnow().isoformat(),
+        "scoring_source": "fallback",
+    }
 
 
 def score_job(job_text: str, url: str) -> dict:
@@ -407,8 +600,26 @@ Analyze this job posting and return ONLY a JSON object with these exact keys:
 Be harsh. If visa sponsorship is unclear or the company has no H1B history, flag it. Score honestly.
 Return ONLY the JSON, no other text.
 """
-    response = generate_with_gemini(prompt)
-    result = _parse_gemini_json(response.text)
+    last_error = None
+    for attempt in range(2):
+        try:
+            response = generate_with_gemini(prompt)
+        except Exception as exc:
+            if ALLOW_FALLBACK_SCORING:
+                return fallback_score_job(job_text, url, str(exc))
+            raise
+        try:
+            result = _parse_gemini_json(response.text)
+            break
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            print(f"[warning] Gemini returned invalid JSON for {url}; retry {attempt + 1}/2.")
+            prompt += "\n\nReturn valid JSON only. Do not include markdown, comments, or prose."
+    else:
+        if ALLOW_FALLBACK_SCORING:
+            return fallback_score_job(job_text, url, f"Gemini returned invalid JSON after retry: {last_error}")
+        raise RuntimeError(f"Gemini returned invalid JSON after retry: {last_error}")
+
     result["url"] = url
     result["scored_at"] = datetime.utcnow().isoformat()
     return result
@@ -518,6 +729,18 @@ def send_notification(score: dict):
     )
 
 
+def send_failure_notification(error: dict):
+    url = error.get("url")
+    message = error.get("error") or "Unknown error"
+    publish_ntfy(
+        title="Job scoring failed",
+        message=f"{url or 'Unknown job URL'}\n{message[:500]}",
+        priority="default",
+        tags=["warning"],
+        click=url,
+    )
+
+
 def summarize_verdicts(scores: list[dict]) -> dict:
     summary = {verdict: 0 for verdict in VERDICT_ORDER}
     for score in scores:
@@ -537,15 +760,18 @@ def group_results_by_verdict(scores: list[dict]) -> dict:
     return grouped
 
 
-def send_batch_notification(summary: dict, scored_count: int):
+def send_batch_notification(summary: dict, scored_count: int, failed_count: int = 0):
     body = (
         f"\U0001f525 {summary.get('Apply Tonight', 0)} Apply Tonight\n"
         f"\u2705 {summary.get('Apply This Weekend', 0)} Apply This Weekend\n"
         f"\U0001f7e1 {summary.get('Low Priority', 0)} Low Priority\n"
         f"\u274c {summary.get('Skip', 0)} Skip"
     )
+    if failed_count:
+        body += f"\nFailed: {failed_count}"
+
     publish_ntfy(
-        title=f"\U0001f4ca Batch complete \u2014 {scored_count} jobs scored",
+        title=f"\U0001f4ca Batch complete \u2014 {scored_count} scored, {failed_count} failed",
         message=body,
         priority="high" if summary.get("Apply Tonight", 0) else "default",
         tags=["briefcase"],
@@ -579,28 +805,34 @@ def process_batch(
     search_url: str,
     send_notification_flag: bool = True,
     progress_callback=None,
+    max_jobs: int | None = None,
 ) -> dict:
     def progress(**kwargs):
         if progress_callback:
             progress_callback(kwargs)
+
+    if max_jobs is not None and max_jobs < 1:
+        max_jobs = None
 
     progress(status="scraping", current=0, total=0, message="Finding LinkedIn jobs...")
     search_text = scrape_linkedin_search(search_url)
     print(f"[debug] Scraped LinkedIn search text first 500 chars:\n{search_text[:500]}")
     job_urls = extract_linkedin_job_urls(search_text)
     print(f"[debug] Found {len(job_urls)} LinkedIn job URLs after extraction.")
-    if not job_urls:
-        for guest_url in build_linkedin_guest_search_urls(search_url):
-            try:
-                guest_text = scrape_linkedin_search(guest_url)
-                job_urls.extend(extract_linkedin_job_urls(guest_text))
-            except Exception:
-                continue
-        job_urls = sorted(set(job_urls))
-        print(f"[debug] Found {len(job_urls)} LinkedIn job URLs after guest fallback extraction.")
 
     if not job_urls:
         raise ValueError("No LinkedIn job URLs were found on that search page.")
+
+    if max_jobs and len(job_urls) > max_jobs:
+        found_count = len(job_urls)
+        job_urls = job_urls[:max_jobs]
+        print(f"[debug] Limiting batch to first {len(job_urls)} of {found_count} LinkedIn job URLs.")
+        progress(
+            status="scraping",
+            current=0,
+            total=len(job_urls),
+            message=f"Found {found_count} jobs. Scoring first {len(job_urls)}...",
+        )
 
     total = len(job_urls)
     results = []
@@ -617,17 +849,32 @@ def process_batch(
             url=job_url,
         )
         try:
-            job_text = scrape_job(job_url)
-            score = score_job(job_text, job_url)
-            scored_scores.append(score)
-            if send_notification_flag:
+            try:
+                job_text = scrape_job(job_url)
+            except Exception as exc:
+                if not ALLOW_FALLBACK_SCORING:
+                    raise
+                job_text = ""
+                score = fallback_score_job("", job_url, f"Job scrape failed: {exc}")
+            else:
                 try:
-                    send_notification(score)
+                    score = score_job(job_text, job_url)
                 except Exception as exc:
-                    notification_errors.append({"url": job_url, "error": str(exc)})
-            saved = save_score(score)
+                    if not ALLOW_FALLBACK_SCORING:
+                        raise
+                    score = fallback_score_job(job_text, job_url, str(exc))
+
+            try:
+                saved = save_score(score)
+            except Exception as exc:
+                if not ALLOW_FALLBACK_SCORING:
+                    raise
+                saved = {**score, "id": None, "save_error": str(exc)}
+                notification_errors.append({"url": job_url, "error": f"Save failed: {exc}"})
+            scored_scores.append(saved)
             results.append(saved)
-            time.sleep(5)  # avoid rate limits between jobs
+            if BATCH_JOB_DELAY_SECONDS:
+                time.sleep(BATCH_JOB_DELAY_SECONDS)
         except Exception as exc:
             print(f"[ERROR] Failed to score {job_url}: {exc}")
             errors.append({"url": job_url, "error": str(exc)})
@@ -636,19 +883,37 @@ def process_batch(
         for e in errors:
             print(f"[BATCH ERROR] {e['url']}: {e['error']}")
 
-    if not scored_scores and errors:
-        raise RuntimeError(f"No jobs were scored. First error: {errors[0]['error']}")
-
     summary = summarize_verdicts(scored_scores)
     grouped_results = group_results_by_verdict(results)
     if send_notification_flag:
-        send_batch_notification(summary, len(scored_scores))
+        progress(
+            status="notifying",
+            current=total,
+            total=total,
+            message=f"Sending notifications for {len(scored_scores)} scored and {len(errors)} failed jobs...",
+        )
+        for score in scored_scores:
+            try:
+                send_notification(score)
+            except Exception as exc:
+                notification_errors.append({"url": score.get("url"), "error": str(exc)})
+        for error in errors:
+            try:
+                send_failure_notification(error)
+            except Exception as exc:
+                notification_errors.append({"url": error.get("url"), "error": str(exc)})
+        send_batch_notification(summary, len(scored_scores), len(errors))
+
+    failed_count = len(errors)
+    complete_message = f"Finished scoring {len(scored_scores)} of {total} jobs."
+    if failed_count:
+        complete_message += f" {failed_count} failed."
 
     progress(
         status="complete",
         current=total,
         total=total,
-        message=f"Finished scoring {len(scored_scores)} of {total} jobs.",
+        message=complete_message,
     )
     return {
         "search_url": search_url,
@@ -668,6 +933,7 @@ def process_search_batch(
     location: str,
     send_notification_flag: bool = True,
     progress_callback=None,
+    max_jobs: int | None = MAX_BATCH_JOBS,
 ) -> dict:
     keywords = keywords.strip()
     location = location.strip()
@@ -681,6 +947,7 @@ def process_search_batch(
         search_url,
         send_notification_flag=send_notification_flag,
         progress_callback=progress_callback,
+        max_jobs=max_jobs,
     )
     result["keywords"] = keywords
     result["location"] = location

@@ -952,9 +952,12 @@ function BatchProgress({ batch }) {
   if (!batch) return null;
   const total = Number(batch.total) || 0;
   const current = Number(batch.current) || 0;
+  const scored = Number(batch.scored ?? batch.result?.scored) || 0;
+  const failed = Number(batch.failed ?? batch.result?.failed) || 0;
+  const errors = batch.errors || batch.result?.errors || [];
   const percent = total ? Math.round((current / total) * 100) : batch.status === "running" ? 18 : 0;
   const label =
-    total && batch.status !== "complete"
+    total && !["complete", "notifying"].includes(batch.status)
       ? `Scoring job ${Math.min(current, total)} of ${total}...`
       : batch.message || "Preparing batch scoring...";
 
@@ -969,9 +972,14 @@ function BatchProgress({ batch }) {
       </div>
       {batch.status === "complete" && batch.summary && (
         <div className="message success">
-          Batch complete. Apply Tonight: {batch.summary["Apply Tonight"] || 0}, Apply This Weekend:{" "}
-          {batch.summary["Apply This Weekend"] || 0}, Low Priority: {batch.summary["Low Priority"] || 0}, Skip:{" "}
-          {batch.summary.Skip || 0}
+          Batch complete. Scored: {scored}, Failed: {failed}. Apply Tonight:{" "}
+          {batch.summary["Apply Tonight"] || 0}, Apply This Weekend: {batch.summary["Apply This Weekend"] || 0}, Low
+          Priority: {batch.summary["Low Priority"] || 0}, Skip: {batch.summary.Skip || 0}
+        </div>
+      )}
+      {batch.status === "complete" && failed > 0 && (
+        <div className="message error">
+          {errors.slice(0, 2).map((item) => item.error || item.url).join(" | ") || `${failed} jobs failed.`}
         </div>
       )}
       {batch.status === "failed" && <div className="message error">{batch.message || "Batch scoring failed."}</div>}

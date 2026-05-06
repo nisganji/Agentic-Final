@@ -94,13 +94,19 @@ def _run_batch(batch_id: str, keywords: str, location: str, send_sms: bool):
         _set_batch_state(
             batch_id,
             status="complete",
-            message=f"Finished scoring {result['scored']} of {result['total']} jobs.",
+            message=(
+                f"Finished scoring {result['scored']} of {result['total']} jobs."
+                + (f" {result['failed']} failed." if result["failed"] else "")
+            ),
             current=result["total"],
             total=result["total"],
+            scored=result["scored"],
+            failed=result["failed"],
             summary=result["summary"],
             grouped_results=result["grouped_results"],
             result=result,
             errors=result["errors"],
+            notification_errors=result["notification_errors"],
         )
     except Exception as exc:
         _set_batch_state(
